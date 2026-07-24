@@ -30,6 +30,10 @@ import (
 
 const maxRetries = 6
 
+// maxStallRetries is the number of times a part may stall-reconnect before
+// the download is considered permanently failed.
+const maxStallRetries = 3
+
 var (
 	errMaxRetriesExceeded   = errors.New("max retries exceeded")
 	errPartStalled          = errors.New("part stalled")
@@ -37,6 +41,12 @@ var (
 )
 
 var blobDownloadManager sync.Map
+
+// velocitySample is a single bandwidth observation recorded by blobDownloadPart.Write.
+type velocitySample struct {
+	t     time.Time
+	bytes int64
+}
 
 type blobDownload struct {
 	Name   string
@@ -62,6 +72,13 @@ type blobDownloadPart struct {
 
 	lastUpdatedMu sync.Mutex
 	lastUpdated   time.Time
+
+	// velocity tracking — rolling 10-second window
+	velocityMu      sync.Mutex
+	velocitySamples []velocitySample
+
+	// staged stall detection counter (reset on each clean retry)
+	stallCount atomic.Int32
 
 	*blobDownload `json:"-"`
 }
@@ -97,12 +114,44 @@ func (p *blobDownloadPart) UnmarshalJSON(b []byte) error {
 }
 
 const (
+	// numDownloadParts is the default (fast network) part count.
 	numDownloadParts          = 16
 	minDownloadPartSize int64 = 100 * format.MegaByte
 	maxDownloadPartSize int64 = 1000 * format.MegaByte
+
+	// velocityWindowDuration is the rolling window for KB/s measurement.
+	velocityWindowDuration = 10 * time.Second
 )
 
+// downloadStallTimeout is the *baseline* timeout used only by tests that
+// override it directly. Production code uses adaptiveStallTimeout() instead.
 var downloadStallTimeout = 30 * time.Second
+
+// adaptiveStallTimeout returns a stall timeout appropriate for the measured
+// download speed. Slow connections are given more breathing room.
+func adaptiveStallTimeout(bps float64) time.Duration {
+	switch {
+	case bps > 100*1024: // > 100 KB/s — fast
+		return 30 * time.Second
+	case bps > 10*1024: // 10–100 KB/s — medium
+		return 60 * time.Second
+	default: // < 10 KB/s — slow
+		return 120 * time.Second
+	}
+}
+
+// adaptivePartCount returns how many parallel download parts to use based on
+// a bandwidth sample. Fewer parts on slow links reduces contention.
+func adaptivePartCount(bps float64) int {
+	switch {
+	case bps > 500*1024: // > 500 KB/s
+		return 16
+	case bps > 50*1024: // 50–500 KB/s
+		return 8
+	default: // < 50 KB/s
+		return 4
+	}
+}
 
 func (p *blobDownloadPart) Name() string {
 	return strings.Join([]string{
@@ -118,13 +167,49 @@ func (p *blobDownloadPart) StopsAt() int64 {
 	return p.Offset + p.Size
 }
 
+// Write satisfies io.Writer. It updates the global completion counter,
+// the lastUpdated timestamp used by stall detection, and appends a velocity
+// sample for the rolling bandwidth window.
 func (p *blobDownloadPart) Write(b []byte) (n int, err error) {
 	n = len(b)
 	p.blobDownload.Completed.Add(int64(n))
+
+	now := time.Now()
+
 	p.lastUpdatedMu.Lock()
-	p.lastUpdated = time.Now()
+	p.lastUpdated = now
 	p.lastUpdatedMu.Unlock()
+
+	// Append velocity sample and evict samples older than the window.
+	p.velocityMu.Lock()
+	p.velocitySamples = append(p.velocitySamples, velocitySample{t: now, bytes: int64(n)})
+	cutoff := now.Add(-velocityWindowDuration)
+	keep := 0
+	for _, s := range p.velocitySamples {
+		if s.t.After(cutoff) {
+			p.velocitySamples[keep] = s
+			keep++
+		}
+	}
+	p.velocitySamples = p.velocitySamples[:keep]
+	p.velocityMu.Unlock()
+
 	return n, nil
+}
+
+// currentBytesPerSec returns the rolling average download speed over the last
+// velocityWindowDuration seconds for this part. Returns 0 if no data yet.
+func (p *blobDownloadPart) currentBytesPerSec() float64 {
+	p.velocityMu.Lock()
+	defer p.velocityMu.Unlock()
+	cutoff := time.Now().Add(-velocityWindowDuration)
+	var total int64
+	for _, s := range p.velocitySamples {
+		if s.t.After(cutoff) {
+			total += s.bytes
+		}
+	}
+	return float64(total) / velocityWindowDuration.Seconds()
 }
 
 func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *registryOptions) error {
@@ -155,7 +240,18 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 
 		b.Total, _ = strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
 
-		size := b.Total / numDownloadParts
+		// --- bandwidth probe: download a small leading slice to estimate speed ---
+		probeSize := int64(512 * 1024) // 512 KB probe
+		if probeSize > b.Total {
+			probeSize = b.Total
+		}
+		probeBps := b.probeBandwidth(ctx, requestURL, opts, probeSize)
+		nParts := adaptivePartCount(probeBps)
+		if probeBps > 0 {
+			slog.Info(fmt.Sprintf("bandwidth probe %.1f KB/s → using %d download parts", probeBps/1024, nParts))
+		}
+
+		size := b.Total / int64(nParts)
 		switch {
 		case size < minDownloadPartSize:
 			size = minDownloadPartSize
@@ -182,6 +278,36 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 	}
 
 	return nil
+}
+
+// probeBandwidth issues a small ranged GET request and returns measured bytes/sec.
+// Returns 0 on any error so the caller falls back to the default part count.
+func (b *blobDownload) probeBandwidth(ctx context.Context, requestURL *url.URL, opts *registryOptions, probeSize int64) float64 {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, requestURL.String(), nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", probeSize-1))
+
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+
+	n, err := io.Copy(io.Discard, resp.Body)
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return 0
+	}
+	elapsed := time.Since(start).Seconds()
+	if elapsed <= 0 || n == 0 {
+		return 0
+	}
+	return float64(n) / elapsed
 }
 
 func (b *blobDownload) Run(ctx context.Context, requestURL *url.URL, opts *registryOptions) {
@@ -284,7 +410,10 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 
 		g.Go(func() error {
 			var err error
+			stallRetries := 0
 			for try := 0; try < maxRetries; try++ {
+				// Reset stall counter on each fresh attempt.
+				part.stallCount.Store(0)
 				w := io.NewOffsetWriter(file, part.StartsAt())
 				err = b.downloadChunk(inner, directURL, w, part)
 				switch {
@@ -292,6 +421,13 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 					// return immediately if the context is canceled or the device is out of space
 					return err
 				case errors.Is(err, errPartStalled):
+					stallRetries++
+					if stallRetries >= maxStallRetries {
+						slog.Error(fmt.Sprintf("%s part %d exceeded max stall retries (%d), giving up",
+							b.Digest[7:19], part.N, maxStallRetries))
+						return fmt.Errorf("%w: part %d stalled too many times", errMaxRetriesExceeded, part.N)
+					}
+					// Stall-reconnect does not consume a try slot.
 					try--
 					continue
 				case err != nil:
@@ -379,10 +515,42 @@ func (b *blobDownload) downloadChunk(ctx context.Context, requestURL *url.URL, w
 					lastUpdated = attemptStarted
 				}
 
-				if time.Since(lastUpdated) > downloadStallTimeout {
-					const msg = "%s part %d stalled; retrying. If this persists, press ctrl-c to exit, then 'ollama pull' to find a faster connection."
-					slog.Info(fmt.Sprintf(msg, b.Digest[7:19], part.N))
-					// reset last updated
+				// Use bandwidth-aware timeout instead of fixed 30s.
+				bps := part.currentBytesPerSec()
+				timeout := adaptiveStallTimeout(bps)
+				// Honour the package-level override used in tests
+				// (downloadStallTimeout is set to a small value in tests).
+				if downloadStallTimeout < timeout {
+					timeout = downloadStallTimeout
+				}
+
+				if time.Since(lastUpdated) <= timeout {
+					continue
+				}
+
+				// --- Multi-stage stall detection ---
+				stallN := part.stallCount.Add(1)
+				switch {
+				case stallN == 1:
+					// First stall: warn and extend grace period.
+					const warnMsg = "%s part %d: slow connection warning (%.1f KB/s), extending timeout"
+					slog.Warn(fmt.Sprintf(warnMsg, b.Digest[7:19], part.N, bps/1024))
+					part.lastUpdatedMu.Lock()
+					part.lastUpdated = time.Now()
+					part.lastUpdatedMu.Unlock()
+					// Continue — do NOT return an error yet.
+				case stallN == 2:
+					// Second stall: reconnect cleanly.
+					const retryMsg = "%s part %d stalled twice; reconnecting. If this persists, press ctrl-c to exit, then 'ollama pull' to find a faster connection."
+					slog.Info(fmt.Sprintf(retryMsg, b.Digest[7:19], part.N))
+					part.lastUpdatedMu.Lock()
+					part.lastUpdated = time.Time{}
+					part.lastUpdatedMu.Unlock()
+					return errPartStalled
+				default:
+					// Third+ stall: hard fail — the outer loop will enforce maxStallRetries.
+					const failMsg = "%s part %d stalled %d times; giving up on this attempt"
+					slog.Error(fmt.Sprintf(failMsg, b.Digest[7:19], part.N, stallN))
 					part.lastUpdatedMu.Lock()
 					part.lastUpdated = time.Time{}
 					part.lastUpdatedMu.Unlock()
